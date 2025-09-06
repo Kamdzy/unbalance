@@ -108,7 +108,17 @@ func Shell2(command string, callback Callback) error {
 
 // StartRsync -
 func StartRsync(workDir string, args ...string) (*exec.Cmd, error) {
-	cmd := exec.Command(cRsyncBin, args...)
+	// Wrap rsync with nice and ionice for low priority execution
+	// nice -n 19: lowest CPU priority
+	// ionice -c2 -n7: best-effort I/O scheduling with lowest priority
+	niceArgs := []string{
+		"-n", "19",
+		"ionice", "-c2", "-n7",
+		cRsyncBin,
+	}
+	niceArgs = append(niceArgs, args...)
+	
+	cmd := exec.Command("nice", niceArgs...)
 	cmd.Dir = workDir
 	cmd.Stderr = os.Stdout
 

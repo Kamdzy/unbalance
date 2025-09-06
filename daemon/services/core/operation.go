@@ -38,7 +38,7 @@ func (c *Core) runOperation(opName string) {
 			command.Dst,
 		)
 
-		cmd := fmt.Sprintf(`rsync %s %s %s`, operation.RsyncStrArgs, strconv.Quote(command.Entry), strconv.Quote(command.Dst))
+		cmd := fmt.Sprintf(`nice -n 19 ionice -c2 -n7 rsync %s %s %s`, operation.RsyncStrArgs, strconv.Quote(command.Entry), strconv.Quote(command.Dst))
 		logger.Blue("command started: (src: %s) %s ", command.Src, cmd)
 
 		operation.Line = cmd

@@ -402,7 +402,7 @@ func (c *Core) notifyCommandsToRun(opName string, operation *domain.Operation) {
 	message := "\n\nThe following commands will be executed:\n\n"
 
 	for _, command := range operation.Commands {
-		cmd := fmt.Sprintf(`(src: %s) rsync %s %s %s`, command.Src, operation.RsyncStrArgs, strconv.Quote(command.Entry), strconv.Quote(command.Dst))
+		cmd := fmt.Sprintf(`(src: %s) nice -n 19 ionice -c2 -n7 rsync %s %s %s`, command.Src, operation.RsyncStrArgs, strconv.Quote(command.Entry), strconv.Quote(command.Dst))
 		message += cmd + "\n"
 	}
 

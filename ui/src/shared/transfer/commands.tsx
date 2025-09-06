@@ -162,7 +162,7 @@ export const Commands: React.FunctionComponent = () => {
 //                     </td>
 //                     <td className="px-6 py-4">{command.src}</td>
 //                     <td className="px-6 py-4  font-medium text-gray-900 whitespace-nowrap dark:text-white">
-//                       rsync {operation.rsyncStrArgs} &quot;{command.entry}
+//                       nice -n 19 ionice -c2 -n7 rsync {operation.rsyncStrArgs} &quot;{command.entry}
 //                       &quot; &quot;{command.dst}&quot;
 //                     </td>
 //                     <td className="flex-auto px-6 py-4">

@@ -37,7 +37,7 @@ export const Command: React.FunctionComponent<Props> = ({
         {command.src}
       </div>
       <div className="col-span-8">
-        rsync {rsyncStrArgs} &quot;{command.entry}&quot; &quot;{command.dst}
+        nice -n 19 ionice -c2 -n7 rsync {rsyncStrArgs} &quot;{command.entry}&quot; &quot;{command.dst}
         &quot;
       </div>
       <div className="col-span-2 flex flex-1 flex-row items-center">
