@@ -154,6 +154,19 @@ func Bind(content any, data any) error {
 	return nil
 }
 
+// LoadAuthHash reads AUTH_PASSWORD_HASH directly from the env file via the ini
+// library. We bypass the start script's bash sourcing because password hashes
+// contain $-prefixed segments (for example bcrypt and Argon2id PHC strings)
+// that bash treats as parameter expansion, mangling the value before the daemon
+// ever sees it.
+func LoadAuthHash(location string) (string, error) {
+	file, err := ini.Load(location)
+	if err != nil {
+		return "", err
+	}
+	return file.Section("").Key("AUTH_PASSWORD_HASH").String(), nil
+}
+
 func LoadEnv(location string, config *domain.Config) error {
 	// load file
 	file, err := ini.Load(location)
@@ -170,6 +183,7 @@ func LoadEnv(location string, config *domain.Config) error {
 	config.RsyncArgs = file.Section("").Key("RSYNC_ARGS").Strings(",")
 	config.Verbosity, _ = file.Section("").Key("VERBOSITY").Int()
 	config.RefreshRate, _ = file.Section("").Key("REFRESH_RATE").Int()
+	config.AuthPassword = file.Section("").Key("AUTH_PASSWORD_HASH").String()
 
 	return nil
 }
@@ -192,6 +206,7 @@ func SaveEnv(location string, config domain.Config) error {
 	file.Section("").Key("RSYNC_ARGS").SetValue(strings.Join(config.RsyncArgs, ","))
 	file.Section("").Key("VERBOSITY").SetValue(strconv.Itoa(config.Verbosity))
 	file.Section("").Key("REFRESH_RATE").SetValue(strconv.Itoa(config.RefreshRate))
+	file.Section("").Key("AUTH_PASSWORD_HASH").SetValue(config.AuthPassword)
 
 	file.SaveTo(location)
 

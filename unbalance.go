@@ -9,7 +9,9 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 
 	"unbalance/daemon/cmd"
+	"unbalance/daemon/common"
 	"unbalance/daemon/domain"
+	"unbalance/daemon/lib"
 )
 
 var Version string
@@ -29,6 +31,9 @@ var cli struct {
 	RsyncArgs      []string `env:"RSYNC_ARGS" default:"-X" help:"custom rsync arguments"`
 	Verbosity      int      `env:"VERBOSITY" default:"0" help:"include rsync output in log files: 0 (default) - include; 1 - do not include"`
 	RefreshRate    int      `env:"REFRESH_RATE" default:"1000" help:"how often to refresh the ui while running a command (in milliseconds)"`
+	AuthEnabled    bool     `env:"AUTH_ENABLED" default:"false" help:"require login before using the web ui"`
+	AuthUsername   string   `env:"AUTH_USERNAME" default:"admin" help:"admin username used to log into the web ui"`
+	AuthPassword   string   `env:"AUTH_PASSWORD_HASH" default:"" help:"stored admin password hash (Argon2id for new passwords; bcrypt remains supported for migration)"`
 
 	Boot cmd.Boot `cmd:"" default:"1" help:"start processing"`
 }
@@ -50,6 +55,16 @@ func main() {
 		// Compress:   true, // disabled by default
 	})
 
+	// Read AUTH_PASSWORD_HASH directly from disk to sidestep bash's mangling
+	// of $-characters in password hashes when the start script sources the
+	// env file. Kong's env-driven value is intentionally overridden.
+	envPath := filepath.Join(common.PluginLocation, "unbalanced.env")
+	if hash, err := lib.LoadAuthHash(envPath); err != nil {
+		log.Printf("warning: unable to read auth hash from %s: %s", envPath, err)
+	} else {
+		cli.AuthPassword = hash
+	}
+
 	log.Printf("cli: %+v", cli)
 
 	err := ctx.Run(&domain.Context{
@@ -64,6 +79,9 @@ func main() {
 			RsyncArgs:      cli.RsyncArgs,
 			Verbosity:      cli.Verbosity,
 			RefreshRate:    cli.RefreshRate,
+			AuthEnabled:    cli.AuthEnabled,
+			AuthUsername:   cli.AuthUsername,
+			AuthPassword:   cli.AuthPassword,
 		},
 		Hub: pubsub.New(23),
 	})
