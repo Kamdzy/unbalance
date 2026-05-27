@@ -9,6 +9,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
@@ -24,6 +26,22 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	// Reject browsers that don't send Origin and any cross-host upgrade
+	// attempt regardless of the auth state. We only compare hosts (not
+	// schemes) so a TLS-terminating reverse proxy that strips the scheme
+	// still works; the per-request validateWebsocketRequest check in auth.go
+	// is what enforces session+CSRF when auth is enabled.
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return false
+		}
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		return strings.EqualFold(u.Host, r.Host)
+	},
 }
 
 type Server struct {
@@ -31,7 +49,13 @@ type Server struct {
 	core          *core.Core
 	engine        *echo.Echo
 	ws            *websocket.Conn
+	wsSession     string
+	wsMu          sync.Mutex
 	broadcastChan chan any
+	sessions      map[string]session
+	sessionMu     sync.Mutex
+	limiter       map[string]loginAttempt
+	limiterMu     sync.Mutex
 }
 
 func Create(ctx *domain.Context, core *core.Core) *Server {
@@ -39,10 +63,16 @@ func Create(ctx *domain.Context, core *core.Core) *Server {
 		ctx:           ctx,
 		core:          core,
 		broadcastChan: ctx.Hub.Sub("socket:broadcast"),
+		sessions:      newSessionStore(),
+		limiter:       newLoginLimiter(),
 	}
 }
 
 func (s *Server) Start() error {
+	if err := s.loadSessions(); err != nil {
+		logger.Yellow("unable to load auth sessions: %s", err)
+	}
+
 	s.engine = echo.New()
 
 	s.engine.HideBanner = true
@@ -66,22 +96,28 @@ func (s *Server) Start() error {
 	s.engine.GET("/ws", s.wsHandler)
 
 	api := s.engine.Group(common.APIEndpoint)
-	api.GET("/config", s.getConfig)
-	api.GET("/state", s.getState)
-	api.GET("/storage", s.getStorage)
-	api.GET("/operation", s.getOperation)
-	api.GET("/history", s.getHistory)
+	api.GET("/auth/status", s.authStatus)
+	api.POST("/auth/login", s.login)
+	api.POST("/auth/setup", s.setup)
+	api.POST("/auth/logout", s.logout, s.requireAuth, s.requireCSRF)
 
-	api.GET("/tree/:route", s.getTree)
-	api.GET("/locate/:route", s.locate)
-	api.GET("/logs", s.getLog)
-	api.PUT("/config/dryRun", s.toggleDryRun)
-	api.PUT("/config/notifyPlan", s.setNotifyPlan)
-	api.PUT("/config/notifyTransfer", s.setNotifyTransfer)
-	api.PUT("/config/reservedSpace", s.setReservedSpace)
-	api.PUT("/config/rsyncArgs", s.setRsyncArgs)
-	api.PUT("/config/verbosity", s.setVerbosity)
-	api.PUT("/config/refreshRate", s.setRefreshRate)
+	protected := s.engine.Group(common.APIEndpoint, s.requireAuth)
+	protected.GET("/config", s.getConfig)
+	protected.GET("/state", s.getState)
+	protected.GET("/storage", s.getStorage)
+	protected.GET("/operation", s.getOperation)
+	protected.GET("/history", s.getHistory)
+
+	protected.GET("/tree/:route", s.getTree)
+	protected.GET("/locate/:route", s.locate)
+	protected.GET("/logs", s.getLog)
+	protected.PUT("/config/dryRun", s.toggleDryRun, s.requireCSRF)
+	protected.PUT("/config/notifyPlan", s.setNotifyPlan, s.requireCSRF)
+	protected.PUT("/config/notifyTransfer", s.setNotifyTransfer, s.requireCSRF)
+	protected.PUT("/config/reservedSpace", s.setReservedSpace, s.requireCSRF)
+	protected.PUT("/config/rsyncArgs", s.setRsyncArgs, s.requireCSRF)
+	protected.PUT("/config/verbosity", s.setVerbosity, s.requireCSRF)
+	protected.PUT("/config/refreshRate", s.setRefreshRate, s.requireCSRF)
 
 	port := fmt.Sprintf(":%s", s.ctx.Port)
 	go func() {
@@ -93,6 +129,7 @@ func (s *Server) Start() error {
 	}()
 
 	go s.onBroadcast()
+	go s.pruneSessions()
 
 	logger.Blue("started service server (listening http on %s) ...", port)
 
@@ -108,6 +145,19 @@ func assetsHandler(content embed.FS) http.Handler {
 }
 
 func (s *Server) wsHandler(c echo.Context) error {
+	if err := s.validateWebsocketRequest(c); err != nil {
+		return err
+	}
+
+	// Capture the session id from the cookie so the read loop and the
+	// session-revocation hooks can identify which connection belongs to
+	// which session. Empty when auth is disabled — sessionStillValid skips
+	// the per-message check in that case.
+	var sessionID string
+	if cookie, err := c.Cookie(sessionCookieName); err == nil {
+		sessionID = cookie.Value
+	}
+
 	conn, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
 	if err != nil {
 		logger.Red("unable to upgrade websocket: %s", err)
@@ -115,31 +165,46 @@ func (s *Server) wsHandler(c echo.Context) error {
 	}
 	defer conn.Close()
 
+	s.wsMu.Lock()
 	s.ws = conn
+	s.wsSession = sessionID
+	s.wsMu.Unlock()
 
-	return s.wsRead()
+	return s.wsRead(conn, sessionID)
 }
 
-func (s *Server) wsRead() (err error) {
+func (s *Server) wsRead(conn *websocket.Conn, sessionID string) (err error) {
 	for {
 		var packet domain.Packet
-		err = s.ws.ReadJSON(&packet)
+		err = conn.ReadJSON(&packet)
 		if err != nil {
 			logger.Red("unable to read websocket message: %s", err)
 			return err
 		}
 
-		logger.Green("packet %+v", packet)
+		// Re-check the session on every inbound packet so an expired,
+		// logged-out, or revoked session can't keep driving destructive
+		// operations through an already-upgraded connection.
+		if s.authRequired() && !s.sessionStillValid(sessionID) {
+			logger.Yellow("websocket session no longer valid; closing connection")
+			return nil
+		}
+
+		logger.Green("packet topic:%s", packet.Topic)
 
 		s.ctx.Hub.Pub(packet, packet.Topic)
 	}
 }
 
 func (s *Server) wsWrite(packet *domain.Packet) (err error) {
-	if (s.ws == nil) || (s.ws.RemoteAddr() == nil) {
+	s.wsMu.Lock()
+	conn := s.ws
+	s.wsMu.Unlock()
+
+	if conn == nil || conn.RemoteAddr() == nil {
 		return
 	}
-	err = s.ws.WriteJSON(packet)
+	err = conn.WriteJSON(packet)
 	return
 }
 
@@ -250,7 +315,12 @@ func (s *Server) setRsyncArgs(c echo.Context) error {
 		return err
 	}
 
-	return c.JSON(200, s.core.SetRsyncArgs(value))
+	config, err := s.core.SetRsyncArgs(value)
+	if err != nil {
+		return echo.NewHTTPError(400, err.Error())
+	}
+
+	return c.JSON(200, config)
 }
 
 func (s *Server) setVerbosity(c echo.Context) error {

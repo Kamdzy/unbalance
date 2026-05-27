@@ -1,7 +1,21 @@
-import { State, Op, Branch } from '~/types';
+import { State, Op, Branch, AuthStatus } from '~/types';
 
 export class Api {
   static host = `${document.location.protocol}//${document.location.host}/api`;
+  static csrfToken = '';
+
+  static setCSRFToken(token: string) {
+    Api.csrfToken = token;
+  }
+
+  static authHeaders() {
+    const headers: Record<string, string> = {};
+    if (Api.csrfToken !== '') {
+      headers['X-CSRF-Token'] = Api.csrfToken;
+    }
+
+    return headers;
+  }
 
   static async getConfig() {
     try {
@@ -19,8 +33,64 @@ export class Api {
         rsyncArgs: [],
         verbosity: 0,
         refreshRate: 0,
+        speedWindow: '90s',
+        authEnabled: false,
+        authUsername: 'admin',
       };
     }
+  }
+
+  static async getAuthStatus(): Promise<AuthStatus> {
+    const response = await fetch(`${Api.host}/auth/status`, {
+      credentials: 'same-origin',
+    });
+
+    return response.json();
+  }
+
+  static async login(username: string, password: string): Promise<AuthStatus> {
+    const response = await fetch(`${Api.host}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ username, password }),
+    });
+
+    if (!response.ok) {
+      throw new Error('Invalid username or password');
+    }
+
+    return response.json();
+  }
+
+  static async setup(username: string, password: string): Promise<AuthStatus> {
+    const response = await fetch(`${Api.host}/auth/setup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ username, password }),
+    });
+
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.message || 'Unable to set admin password');
+    }
+
+    return response.json();
+  }
+
+  static async logout(): Promise<AuthStatus> {
+    const response = await fetch(`${Api.host}/auth/logout`, {
+      method: 'POST',
+      headers: Api.authHeaders(),
+      credentials: 'same-origin',
+    });
+
+    if (!response.ok) {
+      throw new Error('Unable to log out');
+    }
+
+    return response.json();
   }
 
   static async getUnraid(): Promise<State> {
@@ -80,7 +150,7 @@ export class Api {
   static async toggleDryRun(): Promise<void> {
     const options = {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...Api.authHeaders() },
     };
     try {
       const url = `${Api.host}/config/dryRun`;
@@ -93,7 +163,7 @@ export class Api {
   static async setNotifyPlan(value: number): Promise<void> {
     const options = {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...Api.authHeaders() },
       body: JSON.stringify(value),
     };
     try {
@@ -107,7 +177,7 @@ export class Api {
   static async setNotifyTransfer(value: number): Promise<void> {
     const options = {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...Api.authHeaders() },
       body: JSON.stringify(value),
     };
     try {
@@ -121,7 +191,7 @@ export class Api {
   static async setReservedSpace(amount: number, unit: string): Promise<void> {
     const options = {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...Api.authHeaders() },
       body: JSON.stringify({ amount, unit }),
     };
     try {
@@ -135,21 +205,21 @@ export class Api {
   static async setRsyncArgs(flags: string[]): Promise<void> {
     const options = {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...Api.authHeaders() },
       body: JSON.stringify(flags),
     };
-    try {
-      const url = `${Api.host}/config/rsyncArgs`;
-      await fetch(url, options);
-    } catch (e) {
-      console.log('rsyncArgs() error: ', e);
+    const url = `${Api.host}/config/rsyncArgs`;
+    const response = await fetch(url, options);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || response.statusText);
     }
   }
 
   static async setVerbosity(value: number): Promise<void> {
     const options = {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...Api.authHeaders() },
       body: JSON.stringify(value),
     };
     try {
@@ -163,7 +233,7 @@ export class Api {
   static async setRefreshRate(value: number): Promise<void> {
     const options = {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...Api.authHeaders() },
       body: JSON.stringify(value),
     };
     try {

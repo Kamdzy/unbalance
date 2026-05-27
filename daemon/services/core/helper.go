@@ -45,9 +45,9 @@ func getIssues(re *regexp.Regexp, disk *domain.Disk, path string) (int64, int64,
 	}
 
 	scanFolder := folder + "/."
-	cmd := fmt.Sprintf(`find "%s" -exec stat --format "%%A|%%U:%%G|%%F|%%n" {} \;`, scanFolder)
+	findArgs := []string{scanFolder, "-exec", "stat", "--format=%A|%U:%G|%F|%n", "{}", ";"}
 
-	err := lib.Shell2(cmd, func(line string) {
+	err := lib.Stream("find", findArgs, func(line string) {
 		result := re.FindStringSubmatch(line)
 		if result == nil {
 			return
@@ -113,9 +113,9 @@ func getItems(blockSize uint64, re *regexp.Regexp, src, folder string) ([]*domai
 
 	items := make([]*domain.Item, 0)
 
-	cmd := fmt.Sprintf(`find "%s" ! -name . -prune -exec du -bs {} +`, srcFolder+"/.")
+	findArgs := []string{srcFolder + "/.", "!", "-name", ".", "-prune", "-exec", "du", "-bs", "{}", "+"}
 
-	err = lib.Shell2(cmd, func(line string) {
+	err = lib.Stream("find", findArgs, func(line string) {
 		result := re.FindStringSubmatch(line)
 
 		size, _ := strconv.ParseInt(result[1], 10, 64)
@@ -478,9 +478,9 @@ func showPotentiallyPrunedItems(operation *domain.Operation, command *domain.Com
 	if operation.DryRun && operation.OpKind == common.OpGatherMove {
 		parent := filepath.Dir(command.Entry)
 		if parent != "." {
-			logger.Blue(`Would delete empty folders starting from (%s) - (find "%s" -type d -empty -prune -exec rm -rf {} \;) `, filepath.Join(command.Src, parent), filepath.Join(command.Src, parent))
+			logger.Blue("Would prune empty parent folders starting from (%s)", filepath.Join(command.Src, parent))
 		} else {
-			logger.Blue(`WONT DELETE: find "%s" -type d -empty -prune -exec rm -rf {} \;`, filepath.Join(command.Src, parent))
+			logger.Blue("WONT PRUNE: (%s)", filepath.Join(command.Src, parent))
 		}
 	}
 }

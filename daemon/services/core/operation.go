@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,10 +16,23 @@ import (
 	"github.com/teris-io/shortid"
 )
 
+const (
+	defaultSpeedWindow = 90 * time.Second
+	maxSpeedWindow     = 10 * time.Minute
+)
+
 func (c *Core) runOperation(opName string) {
 	logger.Blue("running %s operation ...", opName)
 
 	operation := c.state.Operation
+	if err := validateRsyncArgs(operation.RsyncArgs); err != nil {
+		logger.Yellow("operation:rsync-args:blocked:%s", err)
+		c.publishOperationError("unable to start %s operation: %s", opName, err)
+		c.state.Status = common.OpNeutral
+		c.state.Operation = nil
+		return
+	}
+
 	operation.Started = time.Now()
 
 	if c.ctx.NotifyTransfer == 2 {
@@ -32,20 +46,25 @@ func (c *Core) runOperation(opName string) {
 	commandsExecuted := make([]string, 0)
 
 	for _, command := range operation.Commands {
-		args := append(
-			operation.RsyncArgs,
-			command.Entry,
-			command.Dst,
-		)
+		paths, err := c.validateCommandForExecution(command)
+		if err != nil {
+			cmd := fmt.Sprintf(`rsync %s %s %s`, operation.RsyncStrArgs, strconv.Quote(command.Entry), strconv.Quote(command.Dst))
+			c.commandInterrupted(opName, operation, command, cmd, fmt.Errorf("unsafe command path: %w", err), 0, commandsExecuted)
+			return
+		}
 
-		cmd := fmt.Sprintf(`nice -n 19 ionice -c2 -n7 rsync %s %s %s`, operation.RsyncStrArgs, strconv.Quote(command.Entry), strconv.Quote(command.Dst))
-		logger.Blue("command started: (src: %s) %s ", command.Src, cmd)
+		command.Src = paths.SrcRoot
+		command.Dst = paths.DstRoot
+		command.Entry = paths.Entry
+
+		cmd := fmt.Sprintf(`nice -n 19 ionice -c2 -n7 rsync %s %s %s`, operation.RsyncStrArgs, strconv.Quote(paths.Entry), strconv.Quote(paths.DstRoot))
+		logger.Blue("command started: (src: %s) %s ", paths.SrcRoot, cmd)
 
 		operation.Line = cmd
 		packet := &domain.Packet{Topic: common.EventTransferProgress, Payload: operation}
 		c.ctx.Hub.Pub(packet, "socket:broadcast")
 
-		cmdTransferred, err := c.runCommand(operation, command, args)
+		cmdTransferred, err := c.runCommand(operation, command)
 		if err != nil {
 			c.commandInterrupted(opName, operation, command, cmd, err, cmdTransferred, commandsExecuted)
 			return
@@ -59,12 +78,27 @@ func (c *Core) runOperation(opName string) {
 	c.operationCompleted(opName, operation, commandsExecuted)
 }
 
-func (c *Core) runCommand(operation *domain.Operation, command *domain.Command, args []string) (uint64, error) {
+func (c *Core) runCommand(operation *domain.Operation, command *domain.Command) (uint64, error) {
+	paths, err := c.validateCommandForExecution(command)
+	if err != nil {
+		return 0, fmt.Errorf("unsafe command path: %w", err)
+	}
+
+	command.Src = paths.SrcRoot
+	command.Dst = paths.DstRoot
+	command.Entry = paths.Entry
+
+	args := append(
+		operation.RsyncArgs,
+		paths.Entry,
+		paths.DstRoot,
+	)
+
 	// make sure the command will run
 	c.stopped = false
 
 	// start rsync command
-	cmd, err := lib.StartRsync(command.Src, args...)
+	cmd, err := lib.StartRsync(paths.SrcRoot, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -169,15 +203,16 @@ func (c *Core) monitorRsync(operation *domain.Operation, command *domain.Command
 		// update progress stats
 		transferred = lib.Min(transferred, command.Size)
 
-		percent, left, _ := progress(operation.BytesToTransfer, operation.BytesTransferred+transferred, time.Since(operation.Started))
+		bytesTransferred := operation.BytesTransferred + transferred
+		percent, _, _ := progress(operation.BytesToTransfer, bytesTransferred, time.Since(operation.Started))
 
-		c.updateSamples(operation, operation.BytesTransferred+transferred)
-		speed := c.calculateSpeed(operation, time.Duration(c.ctx.RefreshRate)*time.Millisecond)
+		c.updateSamples(operation, bytesTransferred)
+		speed := c.calculateSpeed(operation)
 
 		operation.Line = current
 		operation.Completed = percent
 		operation.Speed = speed
-		operation.Remaining = left.String()
+		operation.Remaining = remainingAtSpeed(operation.BytesToTransfer, bytesTransferred, speed)
 		operation.DeltaTransfer = transferred
 		command.Transferred = transferred
 		command.Status = common.CmdInProgress
@@ -196,18 +231,18 @@ func (c *Core) commandInterrupted(opName string, operation *domain.Operation, co
 	subject := fmt.Sprintf("unbalanced - %s operation INTERRUPTED", strings.ToUpper(opName))
 	headline := fmt.Sprintf("Command Interrupted: %s (%s)", cmd, err.Error()+" : "+getError(err.Error(), reRsync, rsyncErrors))
 
-	logger.Yellow(headline)
+	logger.Yellow("%s", headline)
 	packet := &domain.Packet{Topic: common.EventOperationError, Payload: fmt.Sprintf("%s operation was interrupted. Check log (/var/log/unbalanced.log) for additional details.", opName)}
 	c.ctx.Hub.Pub(packet, "socket:broadcast")
 
 	operation.BytesTransferred += cmdTransferred
-	percent, left, _ := progress(operation.BytesToTransfer, operation.BytesTransferred, elapsed)
+	percent, _, _ := progress(operation.BytesToTransfer, operation.BytesTransferred, elapsed)
 
-	speed := c.calculateSpeed(operation, time.Duration(c.ctx.RefreshRate)*time.Millisecond)
+	speed := c.calculateSpeed(operation)
 
 	operation.Completed = percent
 	operation.Speed = speed
-	operation.Remaining = left.String()
+	operation.Remaining = remainingAtSpeed(operation.BytesToTransfer, operation.BytesTransferred, speed)
 	operation.DeltaTransfer = cmdTransferred
 	command.Transferred = cmdTransferred
 
@@ -216,16 +251,18 @@ func (c *Core) commandInterrupted(opName string, operation *domain.Operation, co
 
 func (c *Core) commandCompleted(operation *domain.Operation, command *domain.Command) {
 	text := "Command Finished"
-	logger.Blue(text)
+	logger.Blue("%s", text)
 
 	operation.BytesTransferred += command.Size
-	percent, left, _ := progress(operation.BytesToTransfer, operation.BytesTransferred, time.Since(operation.Started))
+	c.updateSamples(operation, operation.BytesTransferred)
 
-	speed := c.calculateSpeed(operation, time.Duration(c.ctx.RefreshRate)*time.Millisecond)
+	percent, _, _ := progress(operation.BytesToTransfer, operation.BytesTransferred, time.Since(operation.Started))
+
+	speed := c.calculateSpeed(operation)
 
 	operation.Completed = percent
 	operation.Speed = speed
-	operation.Remaining = left.String()
+	operation.Remaining = remainingAtSpeed(operation.BytesToTransfer, operation.BytesTransferred, speed)
 	operation.DeltaTransfer = 0
 	operation.Line = text
 	command.Transferred = command.Size
@@ -252,68 +289,31 @@ func (c *Core) handleItemDeletion(operation *domain.Operation, command *domain.C
 
 			packet := &domain.Packet{Topic: common.EventTransferProgress, Payload: operation}
 			c.ctx.Hub.Pub(packet, "socket:broadcast")
-			logger.Yellow(msg)
+			logger.Yellow("%s", msg)
 
 			return
 		}
 
-		exists, _ := lib.Exists(filepath.Join(command.Dst, command.Entry))
-		if exists {
-			rmrf := fmt.Sprintf("rm -rf \"%s\"", filepath.Join(command.Src, command.Entry))
-			operation.Line = fmt.Sprintf("Removing source %s", filepath.Join(command.Src, command.Entry))
+		operation.Line = fmt.Sprintf("Removing source %s", filepath.Join(command.Src, command.Entry))
+
+		packet := &domain.Packet{Topic: common.EventTransferProgress, Payload: operation}
+		c.ctx.Hub.Pub(packet, "socket:broadcast")
+
+		removed, pruned, err := removeTransferredSource(command, operation.OpKind == common.OpGatherMove)
+		if err != nil {
+			msg := fmt.Sprintf("Unable to remove source folder (%s): %s", filepath.Join(command.Src, command.Entry), err)
+			operation.Line = msg
 
 			packet := &domain.Packet{Topic: common.EventTransferProgress, Payload: operation}
 			c.ctx.Hub.Pub(packet, "socket:broadcast")
-			logger.Blue("removing:(%s)", rmrf)
 
-			err := lib.Shell(rmrf, "", func(line string) {
-				logger.Blue(line)
-			})
+			logger.Yellow("%s", msg)
+			return
+		}
 
-			if err != nil {
-				msg := fmt.Sprintf("Unable to remove source folder (%s): %s", filepath.Join(command.Src, command.Entry), err)
-				operation.Line = msg
-
-				packet := &domain.Packet{Topic: common.EventTransferProgress, Payload: operation}
-				c.ctx.Hub.Pub(packet, "socket:broadcast")
-
-				logger.Yellow(msg)
-			}
-
-			if operation.OpKind == common.OpGatherMove {
-				parent := filepath.Dir(command.Entry)
-				// if entry is a user share (tvshows), Dir returns ".", so we won't touch it
-				// if entry is a top-level children of a user share (tvshows/Billions), Dir returns "tvshows"
-				// if entry is a nested children (tvshows/Billions/Season 01), Dir returns "tvshows/Billions"
-				// in the first 2 cases no "/" is present in parent, so I won't prune them
-				if strings.Contains(parent, "/") {
-					rmdir := fmt.Sprintf(`find "%s" -type d -empty -prune -exec rm -rf {} \;`, filepath.Join(command.Src, parent))
-					operation.Line = fmt.Sprintf("Pruning parent %s", filepath.Join(command.Src, parent))
-
-					packet := &domain.Packet{Topic: common.EventTransferProgress, Payload: operation}
-					c.ctx.Hub.Pub(packet, "socket:broadcast")
-
-					logger.Blue("pruning:(%s)", rmdir)
-
-					err = lib.Shell(rmdir, "", func(line string) {
-						logger.Blue(line)
-					})
-
-					if err != nil {
-						msg := fmt.Sprintf("Unable to remove parent folder (%s): %s", filepath.Join(command.Src, parent), err)
-						operation.Line = msg
-
-						packet := &domain.Packet{Topic: common.EventTransferProgress, Payload: operation}
-						c.ctx.Hub.Pub(packet, "socket:broadcast")
-
-						logger.Yellow(msg)
-					}
-				} else {
-					logger.Yellow("skipping:prune:(%s)", filepath.Join(command.Src, parent))
-				}
-			}
-		} else {
-			logger.Yellow("skipping:deletion:(file/folder not present in destination):(%s)", filepath.Join(command.Dst, command.Entry))
+		logger.Blue("removed:(%s)", removed)
+		for _, parent := range pruned {
+			logger.Blue("pruned:(%s)", parent)
 		}
 	}
 }
@@ -325,13 +325,13 @@ func (c *Core) operationCompleted(opName string, operation *domain.Operation, co
 	subject := fmt.Sprintf("unbalanced - %s operation completed", strings.ToUpper(opName))
 	headline := fmt.Sprintf("%s operation has finished", opName)
 
-	percent, left, _ := progress(operation.BytesToTransfer, operation.BytesTransferred, elapsed)
+	percent, _, _ := progress(operation.BytesToTransfer, operation.BytesTransferred, elapsed)
 
-	speed := c.calculateSpeed(operation, time.Duration(c.ctx.RefreshRate)*time.Millisecond)
+	speed := c.calculateSpeed(operation)
 
 	operation.Completed = percent
 	operation.Speed = speed
-	operation.Remaining = left.String()
+	operation.Remaining = remainingAtSpeed(operation.BytesToTransfer, operation.BytesTransferred, speed)
 
 	c.endOperation(subject, headline, commandsExecuted, operation)
 }
@@ -374,12 +374,26 @@ func (c *Core) endOperation(subject, headline string, commands []string, operati
 	logger.Blue("\n%s\n%s", subject, message)
 }
 
-func (c *Core) removeSource(operation *domain.Operation, command *domain.Command) {
+func (c *Core) removeSourceByID(operationID, commandID string) {
+	operation, err := c.historyOperation(operationID)
+	if err != nil {
+		logger.Yellow("removeSource: %s", err)
+		c.publishOperationError("unable to remove source: %s", err)
+		return
+	}
+
+	command, err := findCommand(&operation, commandID)
+	if err != nil {
+		logger.Yellow("removeSource: %s", err)
+		c.publishOperationError("unable to remove source: %s", err)
+		return
+	}
+
 	c.state.Status = operation.OpKind
-	c.state.Operation = operation
+	c.state.Operation = &operation
 	c.state.Unraid = c.refreshUnraid()
 
-	go c.performRemoveSource(operation, command)
+	go c.performRemoveSource(&operation, command)
 }
 
 func (c *Core) performRemoveSource(operation *domain.Operation, cmd *domain.Command) {
@@ -405,7 +419,7 @@ func (c *Core) performRemoveSource(operation *domain.Operation, cmd *domain.Comm
 
 		text := "Removal completed"
 		operation.Line = text
-		logger.Blue(text)
+		logger.Blue("%s", text)
 
 		c.state.Unraid = c.refreshUnraid()
 		c.state.History.Items[operation.ID] = operation
@@ -433,7 +447,14 @@ func (c *Core) performRemoveSource(operation *domain.Operation, cmd *domain.Comm
 	}
 }
 
-func (c *Core) replay(operation domain.Operation) {
+func (c *Core) replay(operationID string) {
+	operation, err := c.historyOperation(operationID)
+	if err != nil {
+		logger.Yellow("replay: %s", err)
+		c.publishOperationError("unable to replay operation: %s", err)
+		return
+	}
+
 	c.state.Status = operation.OpKind
 	c.state.Operation = c.createReplayOperation(operation)
 	c.state.Unraid = c.refreshUnraid()
@@ -454,24 +475,58 @@ func (c *Core) createReplayOperation(original domain.Operation) *domain.Operatio
 		DryRun:          false,
 	}
 
-	operation.RsyncArgs = original.RsyncArgs
+	operation.RsyncArgs = append([]string(nil), original.RsyncArgs...)
 	operation.RsyncStrArgs = strings.Join(operation.RsyncArgs, " ")
 
-	operation.Commands = original.Commands
+	operation.Commands = make([]*domain.Command, 0, len(original.Commands))
+	for _, originalCommand := range original.Commands {
+		if originalCommand == nil {
+			continue
+		}
 
-	for _, command := range operation.Commands {
+		command := *originalCommand
 		command.ID = shortid.MustGenerate()
 		command.Transferred = 0
 		command.Status = common.CmdPending
+		operation.Commands = append(operation.Commands, &command)
 	}
 
 	return operation
 }
 
 func (c *Core) updateSamples(operation *domain.Operation, transferred uint64) {
-	operation.Samples[operation.SampleIndex] = transferred - operation.PrevSample
-	operation.SampleIndex = (operation.SampleIndex + 1) % 60
+	c.updateSamplesAt(operation, transferred, time.Now())
+}
+
+func (c *Core) updateSamplesAt(operation *domain.Operation, transferred uint64, sampledAt time.Time) {
+	if transferred < operation.PrevSample {
+		operation.PrevSample = transferred
+		operation.PrevSampleAt = sampledAt
+		return
+	}
+
+	elapsedFrom := operation.PrevSampleAt
+	if elapsedFrom.IsZero() {
+		elapsedFrom = operation.Started
+	}
+	if elapsedFrom.IsZero() {
+		elapsedFrom = sampledAt
+	}
+
+	if !sampledAt.After(elapsedFrom) {
+		operation.PrevSample = transferred
+		operation.PrevSampleAt = sampledAt
+		return
+	}
+
+	operation.Samples = append(operation.Samples, domain.SpeedSample{
+		Bytes:     transferred,
+		SampledAt: sampledAt,
+	})
+	operation.Samples = c.pruneSpeedSamples(operation.Samples, sampledAt)
+	operation.SampleIndex = len(operation.Samples)
 	operation.PrevSample = transferred
+	operation.PrevSampleAt = sampledAt
 }
 
 func (c *Core) resetSamples(operation *domain.Operation) {
@@ -479,35 +534,101 @@ func (c *Core) resetSamples(operation *domain.Operation) {
 		return
 	}
 
-	for i := range operation.Samples {
-		operation.Samples[i] = 0
-	}
-
+	operation.Samples = nil
 	operation.SampleIndex = 0
 	operation.PrevSample = 0
+	operation.PrevSampleAt = time.Time{}
 }
 
-func (c *Core) calculateSpeed(operation *domain.Operation, rate time.Duration) float64 {
-	var sum uint64
-	var countNonZero int
+func (c *Core) calculateSpeed(operation *domain.Operation) float64 {
+	window := c.speedWindow()
+	cutoff := time.Now().Add(-window)
+	var samples []domain.SpeedSample
 
 	for _, sample := range operation.Samples {
-		if sample <= 0 {
+		if sample.SampledAt.IsZero() || sample.SampledAt.Before(cutoff) {
 			continue
 		}
-
-		sum += sample
-		countNonZero++
+		samples = append(samples, sample)
 	}
 
-	// avoid division by zero
-	if rate.Seconds() == 0 || countNonZero == 0 {
+	if len(samples) < 2 {
 		return 0.0
 	}
 
-	// Calculate average speed based on non-zero samples
-	averageTransferred := float64(sum) / float64(countNonZero)
-	speed := averageTransferred / rate.Seconds() / 1024 / 1024 // MB/s
+	oldest := samples[0]
+	latest := samples[len(samples)-1]
+	elapsed := latest.SampledAt.Sub(oldest.SampledAt)
+	if elapsed <= 0 || latest.Bytes <= oldest.Bytes {
+		return 0.0
+	}
+
+	speed := float64(latest.Bytes-oldest.Bytes) / elapsed.Seconds() / 1024 / 1024 // MB/s
 
 	return speed
+}
+
+func (c *Core) pruneSpeedSamples(samples []domain.SpeedSample, now time.Time) []domain.SpeedSample {
+	window := c.speedWindow()
+	cutoff := now.Add(-window)
+	keepFrom := 0
+	for keepFrom < len(samples) && samples[keepFrom].SampledAt.Before(cutoff) {
+		keepFrom++
+	}
+	if keepFrom == 0 {
+		return samples
+	}
+	return samples[keepFrom:]
+}
+
+func (c *Core) speedWindow() time.Duration {
+	if c == nil || c.ctx == nil || c.ctx.Config.SpeedWindow == "" {
+		return defaultSpeedWindow
+	}
+
+	window, err := time.ParseDuration(strings.TrimSpace(c.ctx.Config.SpeedWindow))
+	if err != nil || window <= 0 {
+		return defaultSpeedWindow
+	}
+	if window > maxSpeedWindow {
+		return maxSpeedWindow
+	}
+	return window
+}
+
+func remainingAtSpeed(bytesToTransfer, bytesTransferred uint64, speed float64) string {
+	if bytesTransferred >= bytesToTransfer {
+		return "0s"
+	}
+	if speed <= 0 {
+		return "unknown"
+	}
+
+	bytesPerSec := speed * 1024 * 1024
+	left := time.Duration(float64(bytesToTransfer-bytesTransferred) / bytesPerSec * float64(time.Second))
+	return formatRemainingDuration(left)
+}
+
+func formatRemainingDuration(duration time.Duration) string {
+	seconds := int64(math.Ceil(duration.Seconds()))
+	if seconds <= 0 {
+		return "0s"
+	}
+
+	hours := seconds / 3600
+	minutes := (seconds - hours*3600) / 60
+	seconds = seconds - hours*3600 - minutes*60
+
+	var parts []string
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
+	}
+	if minutes > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", minutes))
+	}
+	if seconds > 0 {
+		parts = append(parts, fmt.Sprintf("%ds", seconds))
+	}
+
+	return strings.Join(parts, " ")
 }

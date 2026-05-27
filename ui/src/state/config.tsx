@@ -14,6 +14,7 @@ interface ConfigStore {
   rsyncArgs: string[];
   verbosity: number;
   refreshRate: number;
+  speedWindow: string;
   actions: {
     getConfig: () => Promise<void>;
     toggleDryRun: () => Promise<void>;
@@ -38,6 +39,7 @@ export const useConfigStore = create<ConfigStore>()(
     rsyncArgs: ['-X'],
     verbosity: 0,
     refreshRate: 1000,
+    speedWindow: '90s',
     actions: {
       getConfig: async () => {
         const config = await Api.getConfig();
@@ -52,6 +54,7 @@ export const useConfigStore = create<ConfigStore>()(
           state.rsyncArgs = config.rsyncArgs;
           state.verbosity = config.verbosity;
           state.refreshRate = config.refreshRate;
+          state.speedWindow = config.speedWindow;
         });
       },
       toggleDryRun: async () => {
@@ -80,16 +83,16 @@ export const useConfigStore = create<ConfigStore>()(
         await Api.setReservedSpace(amount, unit);
       },
       setRsyncArgs: async (flags: string[]) => {
+        await Api.setRsyncArgs(flags);
         set((state) => {
           state.rsyncArgs = flags;
         });
-        await Api.setRsyncArgs(flags);
       },
       resetRsyncArgs: async () => {
+        await Api.setRsyncArgs(['-X']);
         set((state) => {
           state.rsyncArgs = ['-X'];
         });
-        await Api.setRsyncArgs(['-X']);
       },
       setVerbosity: async (value: number) => {
         set((state) => {

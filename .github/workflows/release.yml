@@ -37,7 +37,7 @@ jobs:
       - name: install node dependencies
         run: |
           cd ui
-          npm install
+          npm ci
           cd ..
 
       - name: build app

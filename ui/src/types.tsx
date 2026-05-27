@@ -22,6 +22,17 @@ export interface Config {
   rsyncArgs: string[];
   verbosity: number;
   refreshRate: number;
+  speedWindow: string;
+  authEnabled: boolean;
+  authUsername: string;
+}
+
+export interface AuthStatus {
+  enabled: boolean;
+  configured: boolean;
+  authenticated: boolean;
+  username: string;
+  csrfToken: string;
 }
 
 export interface Unraid {
@@ -121,6 +132,7 @@ export interface VDisk {
 }
 
 export interface Plan {
+  id: string;
   started: Date;
   ended: Date;
   chosenFolders: string[];
@@ -202,7 +214,7 @@ export enum Topic {
 
 export interface Packet {
   topic: Topic;
-  payload: string;
+  payload: unknown;
 }
 
 export enum ConfirmationKind {

@@ -1,13 +1,23 @@
 import React from 'react';
 
+import { useNavigate } from 'react-router-dom';
 import logo from '~/assets/unbalance-logo.png';
 import { ModeToggle } from '@/components/mode-toggle';
 import { Loading } from '~/shared/icons/loading';
 import { useUnraidIsBusy } from '~/state/unraid';
 import { StatefulLink } from '~/shared/stateful-link/stateful-link';
+import { useAuthActions, useAuthEnabled } from '~/state/auth';
 
 export const Header: React.FunctionComponent = () => {
   const busy = useUnraidIsBusy();
+  const authEnabled = useAuthEnabled();
+  const { logout } = useAuthActions();
+  const navigate = useNavigate();
+
+  const onLogout = async () => {
+    await logout();
+    navigate('/login', { replace: true });
+  };
 
   return (
     <nav className="grid grid-cols-12 gap-2 my-4">
@@ -84,6 +94,11 @@ export const Header: React.FunctionComponent = () => {
         </li>
         <li className="flex flex-row items-center">
           {busy && <Loading />}
+          {authEnabled && (
+            <button className="mr-4 text-sm" onClick={() => void onLogout()}>
+              Log Out
+            </button>
+          )}
           <ModeToggle />
           <span className="pl-2" />
         </li>
