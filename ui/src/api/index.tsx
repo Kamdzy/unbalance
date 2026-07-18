@@ -33,6 +33,7 @@ export class Api {
         rsyncArgs: [],
         verbosity: 0,
         refreshRate: 0,
+        logLines: 100,
         speedWindow: '90s',
         authEnabled: false,
         authUsername: 'admin',
@@ -239,6 +240,20 @@ export class Api {
       await fetch(url, options);
     } catch (e) {
       console.log('verbosity() error: ', e);
+    }
+  }
+
+  static async setLogLines(value: number): Promise<void> {
+    const options = {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ...Api.authHeaders() },
+      body: JSON.stringify(value),
+    };
+    try {
+      const url = `${Api.host}/config/logLines`;
+      await fetch(url, options);
+    } catch (e) {
+      console.log('logLines() error: ', e);
     }
   }
 
