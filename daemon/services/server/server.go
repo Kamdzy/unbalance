@@ -110,6 +110,7 @@ func (s *Server) Start() error {
 
 	protected.GET("/tree/:route", s.getTree)
 	protected.GET("/locate/:route", s.locate)
+	protected.GET("/size/:route", s.size)
 	protected.GET("/logs", s.getLog)
 	protected.PUT("/config/dryRun", s.toggleDryRun, s.requireCSRF)
 	protected.PUT("/config/notifyPlan", s.setNotifyPlan, s.requireCSRF)
@@ -118,6 +119,7 @@ func (s *Server) Start() error {
 	protected.PUT("/config/rsyncArgs", s.setRsyncArgs, s.requireCSRF)
 	protected.PUT("/config/verbosity", s.setVerbosity, s.requireCSRF)
 	protected.PUT("/config/refreshRate", s.setRefreshRate, s.requireCSRF)
+	protected.PUT("/config/logLines", s.setLogLines, s.requireCSRF)
 
 	port := fmt.Sprintf(":%s", s.ctx.Port)
 	go func() {
@@ -267,6 +269,18 @@ func (s *Server) locate(c echo.Context) error {
 	return c.JSON(200, s.core.Locate(path))
 }
 
+func (s *Server) size(c echo.Context) error {
+	param := c.Param("route")
+	u, err := url.Parse(param)
+	if err != nil {
+		return err
+	}
+
+	path := filepath.Join("/", "mnt", "user", path.Clean(u.Path))
+
+	return c.JSON(200, s.core.Size(path))
+}
+
 func (s *Server) getLog(c echo.Context) error {
 	return c.JSON(200, s.core.GetLog())
 }
@@ -331,6 +345,16 @@ func (s *Server) setVerbosity(c echo.Context) error {
 	}
 
 	return c.JSON(200, s.core.SetVerbosity(value))
+}
+
+func (s *Server) setLogLines(c echo.Context) error {
+	var value int
+	err := c.Bind(&value)
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(200, s.core.SetLogLines(value))
 }
 
 func (s *Server) setRefreshRate(c echo.Context) error {
